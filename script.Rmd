@@ -1,0 +1,397 @@
+---
+title: "script"
+output: html_document
+date: "2023-09-06"
+---
+
+## R Markdown
+
+```{r Diretorio e bibliotecas}
+#Acredito que setar não é preciso setar o diretório no Rmd, tester sem depois
+setwd("C:/Users/lucas/Documents/Bioinfo")
+getwd()
+
+library("edgeR")
+library("sva")
+library(org.Hs.eg.db)
+
+```
+
+```{r funcao para ler arquivos}
+# Função para ler os arquivos tabular no diretório de trabalho
+ler_arquivos_tabular <- function(diretorio) {
+  
+  arquivos <- list.files(path = diretorio, pattern = "\\.tabular$", full.names = TRUE)
+  
+  # Exibir a quantidade de arquivos .tabular encontrados
+  cat(length(arquivos), " arquivo(s) tabular encontrado(s).\n")
+  
+  # Verificar se arquivos tabulares foram encontrados
+  if (length(arquivos) == 0) {
+    stop("Nenhum arquivo tabular encontrado.")
+  }
+  else 
+    
+    DG <- readDGE(arquivos, header = FALSE)
+  return(DG)
+}
+```
+
+```{r}
+# Objeto usado na função ler_arquivos_tabular
+diretorio <- "C:/Users/lucas/Documents/Bioinfo/Project"
+DG <- ler_arquivos_tabular(diretorio)
+
+
+# Dessa forma, idealmente não será necessária repetição de código
+arquivos_controle <- c('SRR8481467.tabular')
+
+arquivos_casos <- c('SRR8481464.tabular', 'SRR8481465.tabular', 
+                    'SRR8481466.tabular')
+
+```
+
+```{r}
+# Criar listas vazias para armazenar os objetos (ctr e cs)
+controles <- list()
+casos <- list()
+
+# Objetos de caso foram padronizados como cs (caso), para tornar o código reaproveitável em outras pesquisas
+
+# Loop para ler e criar os objetos de controle
+for (i in seq_along(arquivos_controle)) {
+  nome_objeto <- paste0('ctr', i)  # Nome do objeto
+  arquivo <- arquivos_controle[i]  # Nome do arquivo
+  controles[[nome_objeto]] <- read.table(arquivo, sep = '\t', header = FALSE)
+}
+
+# Loop para ler e criar os objetos de caso
+for (i in seq_along(arquivos_casos)) {
+  nome_objeto <- paste0('cs', i)  # Nome do objeto
+  arquivo <- arquivos_casos[i]  # Nome do arquivo
+  casos[[nome_objeto]] <- read.table(arquivo, sep = '\t', header = FALSE)
+}
+```
+
+```{r}
+# Combinar os datasets em uma matrix.
+geneCounts <- data.frame(controles[[1]][, 2], 
+                         casos[[1]][, 2], casos[[2]][, 2], casos[[3]][, 2])
+
+# Definir os nomes das linhas com base no controle.
+row.names(geneCounts) <- controles[[1]][, 1]
+
+sizeGeneCounts <- dim(geneCounts)
+
+geneCounts <- geneCounts[1:(sizeGeneCounts[1]-5),]
+```
+
+```{r}
+# Definir quantidade de casos e controles (Não esquecer)
+quantidade_controles <- 1
+quantidade_casos <- 3
+```
+
+```{r}
+## Devemos seguir a ordem de condição de geneCounts.
+condition <- c(rep('ctr', quantidade_controles), rep('cs', quantidade_casos))
+
+# Criar um vetor de nomes de amostras
+sampleNames <- character(length = (quantidade_controles + quantidade_casos))
+
+# Preencher o vetor de nomes de amostras com base nas condições
+for (i in 1:(quantidade_controles + quantidade_casos)) {
+  if (i <= quantidade_controles) {
+    sampleNames[i] <- paste0('ctr', i)
+  } else {
+    sampleNames[i] <- paste0('cs', i - quantidade_controles)
+  }
+}
+
+# Atribuir os nomes de coluna à matriz geneCounts
+colnames(geneCounts) <- sampleNames
+
+geneCounts
+
+# view(geneCounts)
+```
+
+```{r}
+## Construir o modelo linear generalizado - ele será usado para a análise de 
+## expressão diferencial.
+dge <- DGEList(counts=geneCounts, group=condition)
+design <- model.matrix(~condition+0, data=dge$samples)
+colnames(design) <- gsub("condition","",colnames(design))
+
+```
+
+```{r}
+## Normalização por TMM (Trimmed Mean of M-values) e plot do resultado.
+## O método TMM calcula fatores de normalização que representam vieses 
+## específicos de cada amostra.
+dge <- calcNormFactors(dge)
+plotMDS(dge)
+norm_counts <- cpm(dge,log = TRUE, prior.count = 3)
+exp <- as.data.frame(norm_counts)
+```
+
+```{r}
+## Salvar o plot acima (TMM) em formato .jpeg.
+jpeg(file="GSE202182_MDSplot.jpeg", width=5000, height=5000, units="px", res=300)
+plotMDS(dge)
+dev.off()
+```
+
+```{r}
+## Estimar a dispersão e plotar o resultado.
+disp <- estimateGLMCommonDisp(dge, design)
+disp <- estimateGLMTrendedDisp(disp, design)
+disp <- estimateGLMTagwiseDisp(disp, design)
+plotBCV(disp)
+```
+
+```{r}
+## Save the BCV plot in .jpeg format.
+jpeg(file="GSE202182_BCVplot.jpeg", width=5000, height=5000, units="px", res=300)
+plotBCV(disp)
+dev.off()
+```
+
+```{r}
+## SVA precisa trabalhar com matrix e não com data frame. Criamos design0 para não
+## editar o original (desing).
+design0 <- as.data.frame(design)
+design0 <- model.matrix(~1, data=design0)
+```
+
+```{r}
+## Estimativa do número de fatores latentes.
+n.sv <- num.sv(norm_counts,design,method="leek")
+```
+
+```{r}
+## Função SVA.
+svobj <- sva(norm_counts,design,design0,n.sv=n.sv)
+svobj.df <- data.frame(svobj$sv)
+```
+
+```{r}
+## Função CleaningP.
+cleaningP <- function(y, design, svaobj,  P=ncol(design)) {
+  X=cbind(design,svaobj$sv)
+  Hat=solve(t(X)%*%X)%*%t(X)
+  beta=(Hat%*%t(y))
+  cleany=y-t(as.matrix(X[,-c(1:P)])%*%beta[-c(1:P),])
+  return(cleany)
+}
+```
+
+```{r}
+## Compare a variância da PCA com e sem correção de SVA.
+## Com correção:
+cleanp <- cleaningP(norm_counts,design,svobj)
+pca <- prcomp(t(cleanp))
+plot(pca)
+
+```
+
+```{r}
+## Sem correção:
+pca0 <- prcomp(t(norm_counts))
+plot(pca0)
+```
+
+```{r}
+## Salvar a variância da PCA com a correção SVA:
+jpeg(file="GSE202182_PCAwiSVA.jpeg", width=5000, height=5000, units="px", res=300)
+plot(pca)
+dev.off()
+```
+
+```{r}
+## Salvar a variância da PCA sem a correção SVA:
+jpeg(file="GSE202182_PCAwoSVA.jpeg", width=5000, height=5000, units="px", res=300)
+plot(pca0)
+dev.off()
+```
+
+```{r}
+## Plotar a PCA das amostras. 
+## Você pode modificar conforme suas preferências.
+sv.p3Ascores <- pca$x
+plot(sv.p3Ascores[,1], sv.p3Ascores[,2], xlab="PCA 1", ylab="PCA 2",
+     type="p", cex.lab=0.75, cex.axis=0.75, 
+     #xlim=c(-200,250), ylim=c(-200,170),
+     col=c('blue','blue','blue', 'blue', 'blue',
+           'red','red', 'red', 'red'),
+     main="PCA scores", cex.main=1.2, font.main=1,pch=15)
+text(sv.p3Ascores, colnames(sampleNames), cex=0.5, pos=4, col="black")
+legend("bottomright", legend=c("Controles","Casos"),
+       bty="n", xjust = 1, yjust = 1,
+       cex=.75, y.intersp=1, col=c('blue', 'red'), pch=20)
+
+## Salvar o plot da PCA.
+jpeg(file="GSE202182_PCA.jpeg", width=3200, height=3200, units="px", res=300)
+plot(sv.p3Ascores[,1], sv.p3Ascores[,2], xlab="PCA 1", ylab="PCA 2",
+     type="p", cex.lab=0.75, cex.axis=0.75, 
+     #xlim=c(-200,250), ylim=c(-200,170),
+     col=c('blue','blue','blue', 'blue', 'blue',
+           'red','red', 'red', 'red'),
+     main="PCA scores", cex.main=1.2, font.main=1,pch=15)
+text(sv.p3Ascores, colnames(sampleNames), cex=0.5, pos=4, col="black")
+legend("bottomright", legend=c("Controles","Casos"),
+       bty="n", xjust = 1, yjust = 1,
+       cex=.75, y.intersp=1, col=c('blue', 'red'), pch=20)
+dev.off()
+```
+
+```{r}
+## Executar a análise de genes diferencialmente expressos (DGE).
+## Ajustar o modelo linear com as variáveis substitutas incluídas.
+modSv <- cbind(design,svobj.df)
+fit <- glmFit(disp, modSv)
+lrt <- glmLRT(fit)
+topTags(lrt)
+```
+
+```{r}
+## Informar qual comparação deseja realizar.
+## As amostras de casos (neste caso, cvd) devem vir antes das controle (ctr).
+## Deve ser makeContrasts(cvd-ctr e não makeContrasts(ctr-cvd.
+csVSctr <- makeContrasts(cs-ctr, levels=modSv)
+```
+
+```{r}
+## Obter o símbolo do gene.
+## Instalar o pacote org.Hs.eg.db (H. sapiens) e carregar a biblioteca:
+# BiocManager::install("org.Hs.eg.db")
+genes.map <- select(org.Hs.eg.db, 
+                    as.character(controles[[1]]$V1),c("SYMBOL","ENTREZID"), "ENTREZID")
+
+## Executar o teste de expressão diferencial para a comparação.
+lrt.csVSctr <- glmLRT(fit, contrast=csVSctr)
+res.csVSctr<-topTags(lrt.csVSctr, n=60000, sort.by = "p.value")
+
+## Adicionar os nomes dos genes.
+table.csVSctr <- as.data.frame(res.csVSctr$table)
+table.csVSctr$ENTREZID <- row.names(table.csVSctr)
+table.csVSctr <- merge(table.csVSctr,genes.map)
+```
+
+```{r}
+## Criar planilha .csv com os resultados da análise DGE.
+write.csv(table.csVSctr, file="GSE125554_SVA.csv")
+```
+
+```{r}
+# Ler a tabela original
+tabela_original <- read.csv("GSE125554_SVA.csv", header = TRUE)
+
+# Aplicar os filtros ue foram adicionados no google sheets em aula
+tabela_filtrada <- tabela_original[!is.na(tabela_original$SYMBOL), ]
+tabela_filtrada <- tabela_filtrada[tabela_filtrada$FDR <= 0.05, ]
+tabela_filtrada <- tabela_filtrada[tabela_filtrada$logFC <= -2 | tabela_filtrada$logFC >= 2, ]
+
+# Salvar a tabela filtrada em um arquivo CSV
+write.csv(tabela_filtrada, file = "GSE125554_SVA_filtrada.csv", row.names = FALSE)
+```
+
+```{r}
+#análise de superrepresentação de ontologias
+#abrir pacotes
+library("DOSE")
+library("clusterProfiler")
+library("org.Hs.eg.db")
+library("KEGG.db")
+
+print(colnames(tabela_filtrada))
+print(tabela_filtrada$Symbol)
+print(class(tabela_filtrada$Symbol))
+print(head(tabela_filtrada$Symbol))
+
+#buscar os ENTREZID dos genes
+genes <- AnnotationDbi::select(org.Hs.eg.db, keys=tabela_filtrada$SYMBOL, columns=c("SYMBOL", "ENTREZID"), keytype="SYMBOL")
+
+#buscar as ontologias
+ego <- enrichGO(gene          = unique(na.omit(genes$ENTREZID)),
+                OrgDb         = org.Hs.eg.db,
+                ont           = "BP",
+                pAdjustMethod = "fdr",
+                pvalueCutoff  = 0.05)
+
+#superrepresentação de ontologias
+enrich.go<- setReadable(ego,org.Hs.eg.db, keyType = "ENTREZID")
+
+#transformar em dataframe
+go.table <- as.data.frame(enrich.go)
+
+#criar um dotplot com as 20 primeiras ontologias
+dotplot(ego, showCategory=20)
+
+#salvar a figura
+jpeg(file="dotplot_GSE125554_downregulated.jpeg", width=6200, height=4800, units="px", res=600)
+dotplot(ego, showCategory=20)
+dev.off()
+
+#salvar a tabela completa das GO superrepresentadas
+write.csv(go.table, "GO_GSE125554_downregulated.csv")
+
+
+```
+
+```{r}
+# Carregar pacotes
+library(enrichplot)
+library(org.Hs.eg.db)
+library(pathview)
+
+# Buscar os ENTREZID e adicionar à tabela_filtrada
+genes.filtrada <- AnnotationDbi::select(org.Hs.eg.db, 
+                                        keys=tabela_filtrada$SYMBOL, 
+                                        columns=c("SYMBOL", "ENTREZID"), 
+                                        keytype="SYMBOL")
+
+# Verificar se a correspondência é única
+if (any(duplicated(genes.filtrada$SYMBOL))) {
+  stop("A correspondência entre SYMBOL e ENTREZID não é única.")
+}
+
+# Adicionar ENTREZID à tabela_filtrada
+tabela_filtrada$ENTREZID <- genes.filtrada$ENTREZID
+
+# Criar uma lista baseada nos valores de logFC
+geneList <- tabela_filtrada$logFC
+names(geneList) <- tabela_filtrada$ENTREZID
+geneList = sort(geneList, decreasing = TRUE)
+
+# Restante do código...
+
+
+# Realizar o enriquecimento de vias
+gsea.kegg <- gseKEGG(geneList=geneList, 
+                     organism = 'hsa',
+                     nPerm = 10000, 
+                     minGSSize = 3, 
+                     maxGSSize = 800, 
+                     pvalueCutoff = 1, 
+                     verbose = TRUE, 
+                     pAdjustMethod = "fdr")
+
+# Visualizar e filtrar os resultados significativos
+gsea.kegg.df <- gsea.kegg@result
+gsea.kegg.sig <- gsea.kegg.df[which(gsea.kegg.df$p.adjust < 0.05),]
+
+# Plotar os resultados
+gseaplot(gsea.kegg, by = "all", title = gsea.kegg$Description[2], geneSetID = 2)
+
+# Visualizar as alterações na via
+hsa04110 <- pathview(gene.data  = geneList,
+                     pathway.id = "hsa04110",
+                     species    = "hsa")
+
+# Salvar o resultado completo do GSEA KEGG
+write.csv(gsea.kegg.sig, "KEGG_GSE7305_downregulated.csv")
+
+
+```
+
